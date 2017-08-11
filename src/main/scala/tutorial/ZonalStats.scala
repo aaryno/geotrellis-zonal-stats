@@ -42,6 +42,7 @@ object ZonalStats {
         .set("spark.kryo.registrator", "geotrellis.spark.io.kryo.KryoRegistrator")
 
     val sc = new SparkContext(conf)
+
     try {
       run(sc)
       // Pause to wait to close the spark context,
