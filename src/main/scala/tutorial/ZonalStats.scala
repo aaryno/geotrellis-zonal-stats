@@ -11,6 +11,8 @@ import geotrellis.spark.io.file._
 import geotrellis.spark.io.hadoop._
 import geotrellis.spark.io.index._
 import geotrellis.spark.tiling._
+import geotrellis.raster.rasterize._
+import geotrellis.raster.rasterize.polygon._
 
 import geotrellis.vector._
 import geotrellis.vector.io._
@@ -37,6 +39,7 @@ object ZonalStats {
     val conf =
       new SparkConf()
         .setAppName("Spark Tiler")
+        .setMaster("local[*]")
         .set("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
         .set("spark.kryo.registrator", "geotrellis.spark.io.kryo.KryoRegistrator")
 
@@ -58,39 +61,92 @@ object ZonalStats {
   def run(implicit sc: SparkContext) = {
      val inputRdd: RDD[(ProjectedExtent, Tile)] = 
         S3GeoTiffRDD.spatial("gfw2-data", "alerts-tsv/temp/rasters")
+        
 
     // Use the "TileLayerMetadata.fromRdd" call to find the zoom
     // level that the closest match to the resolution of our source image,
     // and derive information such as the full bounding box and data type.
     val (_, rasterMetaData) =
-      TileLayerMetadata.fromRdd(inputRdd, FloatingLayoutScheme(512))
+      TileLayerMetadata.fromRdd(inputRdd, FloatingLayoutScheme(1024))
 
     // Use the Tiler to cut our tiles into tiles that are index to a floating layout scheme.
     // We'll repartition it so that there are more partitions to work with, since spark
     // likes to work with more, smaller partitions (to a point) over few and large partitions.
     val tiledRDD: RDD[(SpatialKey, Tile)] =
       inputRdd
-        .tileToLayout(rasterMetaData.cellType, rasterMetaData.layout, Bilinear)
-        .repartition(100)
+        .tileToLayout(rasterMetaData.cellType, rasterMetaData.layout,
+        Tiler.Options(resampleMethod=Bilinear, partitioner=new HashPartitioner(1000)))
 
      val layerRdd: TileLayerRDD[SpatialKey] =
       ContextRDD(tiledRDD, rasterMetaData)
-
-    val extent = rasterMetaData.extent
 
     val filename = "/tmp/all_within_tile_0_0.geojson"
     val fc = Source.fromFile(filename).getLines.mkString.stripMargin
     val features = fc.parseGeoJson[JsonFeatureCollection].getAllPolygons()
 
-    def calc (poly: Polygon, layer: TileLayerRDD[SpatialKey]) : Double = {
-          val result = layer.polygonalSumDouble(poly)
-          println(result)
-          return result
+    val polygons: Map[String, Polygon] = ???
 
-    }
+      // Sequence op - combine one value with our aggregate value
+      val seqOp: (Map[String, Double], Raster[Tile]) => Map[String, Double] =
+        { (acc, raster) =>
+          val extent = raster.extent
+          val env = extent.toPolygon
 
-    features.map(f => calc(f, layerRdd))
-    
+          polygons
+            .filter { tup => env.intersects(tup._2) }
+            .map { case (name, polygon) =>
+              var v = 0.0
+              var cellArea = 10
+
+              if (polygon.contains(env)) {
+                // polygon contains this whole tile, so
+                // sum up the value of tile
+                raster.tile.foreachDouble { z =>
+                  if(isData(z)) { v += z * cellArea }
+                }
+              } else {
+                // Polygon only partially intersects the tile,
+                // use fractional rasterization.
+                val tile = raster.tile
+                val intersections =
+                  polygon.intersection(env) match {
+                    case PolygonResult(intersectionPoly) => Seq(intersectionPoly)
+                    case MultiPolygonResult(mp) => mp.polygons.toSeq
+                    case _ => Seq()
+                  }
+
+                intersections
+                  .map { p =>
+                    FractionalRasterizer.foreachCellByPolygon(p, raster.rasterExtent)(
+                      new FractionCallback {
+                        def callback(col: Int, row: Int, fraction: Double): Unit = {
+                          v += tile.getDouble(col, row) * cellArea * fraction
+                        }
+                      }
+                    )
+                  }
+              }
+
+              (name, v)
+            }
+            .toMap
+        }
+
+      // Combine op - combine two aggregate sums
+      val combOp: (Map[String, Double], Map[String, Double]) => Map[String, Double] =
+        { (acc1, acc2) =>
+          (acc1.keySet ++ acc2.keySet)
+            .map { k => k -> (acc1.get(k).toList ::: acc2.get(k).toList) }
+            .map { case (k, vs) => (k, vs.sum) }
+            .toMap
+        }
+
+      val volume =
+        layerRdd
+          .asRasters
+          .map(_._2)
+          .aggregate(Map[String, Double]())(seqOp, combOp)
+
 
   }
 }
