@@ -36,7 +36,6 @@ object ZonalStats {
     // Setup Spark to use Kryo serializer.
     val conf =
       new SparkConf()
-        .setMaster("local[*]")
         .setAppName("Spark Tiler")
         .set("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
         .set("spark.kryo.registrator", "geotrellis.spark.io.kryo.KryoRegistrator")
