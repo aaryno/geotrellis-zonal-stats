@@ -59,9 +59,9 @@ object ZonalStats {
   def fullPath(path: String) = new java.io.File(path).getAbsolutePath
 
   def run(implicit sc: SparkContext) = {
-     val inputRdd: RDD[(ProjectedExtent, Tile)] = 
+     val inputRdd: RDD[(ProjectedExtent, Tile)] =
         S3GeoTiffRDD.spatial("gfw2-data", "alerts-tsv/temp/rasters")
-        
+
 
     // Use the "TileLayerMetadata.fromRdd" call to find the zoom
     // level that the closest match to the resolution of our source image,
@@ -82,9 +82,13 @@ object ZonalStats {
 
     val filename = "/tmp/all_within_tile_0_0.geojson"
     val fc = Source.fromFile(filename).getLines.mkString.stripMargin
-    val features = fc.parseGeoJson[JsonFeatureCollection].getAllPolygons()
 
-    val polygons: Map[String, Polygon] = ???
+    case class IsoData(ISO: String, ID_1: Int, ID_2: Int)
+    implicit val IsoFormat = jsonFormat3(IsoData)
+
+    // this only covers polygons-- need to add multipolygons at some point
+    val polygons: Map[String, PolygonFeature[IsoData]] = fc.parseGeoJson[JsonFeatureCollectionMap]
+                                                        .getAllPolygonFeatures[IsoData]
 
       // Sequence op - combine one value with our aggregate value
       val seqOp: (Map[String, Double], Raster[Tile]) => Map[String, Double] =
